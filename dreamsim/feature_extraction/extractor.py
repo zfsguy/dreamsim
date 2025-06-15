@@ -50,8 +50,6 @@ class ViTExtractor(nn.Module):
         if type(self.p) is tuple:
             self.p = self.p[0]
         self.stride = self.model.patch_embed.proj.stride
-        self._feats = []
-        self.hook_handlers = []
         self.load_size = None
         self.num_patches = None
 
@@ -203,32 +201,35 @@ class ViTExtractor(nn.Module):
         torch.cuda.manual_seed_all(seed)
 
 
-    def _get_hook(self):
+    def _get_hook(self, feats: List[torch.Tensor]):
         """
         generate a hook method for a specific block and facet.
         """
         def _hook(model, input, output):
-            self._feats.append(output)
+            feats.append(output)
         return _hook
 
-    def _register_hooks(self, layers: List[int],drop_rate=0) -> None:
+    def _register_hooks(self, layers: List[int], feats: List[torch.Tensor], drop_rate=0) -> List[torch.utils.hooks.RemovableHandle]:
         """
         register hook to extract features.
         :param layers: layers from which to extract features.
+        :param feats: list to append the outputs to.
+        :return: list of hook handles
         """
+        handles = []
         if drop_rate > 0:
-            self.hook_handlers.append(self.model.blocks[0].register_forward_pre_hook(self._get_drop_hook(drop_rate)))
+            handles.append(self.model.blocks[0].register_forward_pre_hook(self._get_drop_hook(drop_rate)))
         for block_idx, block in enumerate(self.model.blocks):
             if block_idx in layers:
-                self.hook_handlers.append(block.register_forward_hook(self._get_hook()))
+                handles.append(block.register_forward_hook(self._get_hook(feats)))
+        return handles
 
-    def _unregister_hooks(self) -> None:
+    def _unregister_hooks(self, handles: List[torch.utils.hooks.RemovableHandle]) -> None:
         """
         unregisters the hooks. should be called after feature extraction.
         """
-        for handle in self.hook_handlers:
+        for handle in handles:
             handle.remove()
-        self.hook_handlers = []
 
     def _extract_features(self, batch: torch.Tensor, layers: List[int] = 11, drop_rate=0) -> List[torch.Tensor]:
         """
@@ -238,17 +239,15 @@ class ViTExtractor(nn.Module):
         :return : tensor of features with shape Bxtxd
         """
         B, C, H, W = batch.shape
-        self._feats = []
-        self._register_hooks(layers, drop_rate)
+        feats: List[torch.Tensor] = []
+        handles = self._register_hooks(layers, feats, drop_rate)
         try:
             _ = self.model(batch)
-            self._unregister_hooks()
-        except Exception as e:
-            self._unregister_hooks()
-            raise e
+        finally:
+            self._unregister_hooks(handles)
         self.load_size = (H, W)
         self.num_patches = (1 + (H - self.p) // self.stride[0], 1 + (W - self.p) // self.stride[1])
-        return self._feats
+        return feats
 
     def extract_descriptors(self, batch: torch.Tensor, layer: int = 11, drop_rate=0) -> torch.Tensor:
         """
@@ -260,8 +259,8 @@ class ViTExtractor(nn.Module):
         if type(layer) is not list:
             layer = [ layer ]
 
-        self._extract_features(batch, layer, drop_rate)
-        x = torch.stack(self._feats, dim=1)
+        feats = self._extract_features(batch, layer, drop_rate)
+        x = torch.stack(feats, dim=1)
         x = x.unsqueeze(dim=2) #Bxlx1xtxd # Default to facet = "token", always include CLS token
         desc = x.permute(0, 1, 3, 4, 2).flatten(start_dim=-2, end_dim=-1).unsqueeze(dim=2)  # Bxlx1xtx(dxh)
         return desc
