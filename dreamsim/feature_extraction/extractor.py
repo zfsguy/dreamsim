@@ -1,4 +1,5 @@
 import types
+import threading
 from typing import List, Tuple
 import math
 import torch
@@ -50,8 +51,8 @@ class ViTExtractor(nn.Module):
         if type(self.p) is tuple:
             self.p = self.p[0]
         self.stride = self.model.patch_embed.proj.stride
-        self._feats = []
-        self.hook_handlers = []
+        self._thread_local = threading.local()
+        self._setup_hooks()
         self.load_size = None
         self.num_patches = None
 
@@ -184,16 +185,6 @@ class ViTExtractor(nn.Module):
         else:
             return self.model(x)
 
-    def _get_drop_hook(self, drop_rate):
-
-        def dt_pre_hook(module, tkns):
-            bp_ = torch.ones_like(tkns[0][0, :, 0])
-            bp_[1:] = drop_rate  # do not drop the [cls] token!
-            tkns = tkns[0][:, torch.bernoulli(bp_) > 0.5, :]
-            return tkns
-
-        return dt_pre_hook
-
     def fix_random_seeds(suffix):
         """
         Fix random seeds.
@@ -203,32 +194,41 @@ class ViTExtractor(nn.Module):
         torch.cuda.manual_seed_all(seed)
 
 
-    def _get_hook(self):
-        """
-        generate a hook method for a specific block and facet.
-        """
-        def _hook(model, input, output):
-            self._feats.append(output)
-        return _hook
+    def _setup_hooks(self) -> None:
+        """Register persistent hooks that route activations to thread-local storage."""
 
-    def _register_hooks(self, layers: List[int],drop_rate=0) -> None:
-        """
-        register hook to extract features.
-        :param layers: layers from which to extract features.
-        """
-        if drop_rate > 0:
-            self.hook_handlers.append(self.model.blocks[0].register_forward_pre_hook(self._get_drop_hook(drop_rate)))
-        for block_idx, block in enumerate(self.model.blocks):
-            if block_idx in layers:
-                self.hook_handlers.append(block.register_forward_hook(self._get_hook()))
+        def make_hook(idx):
+            def _hook(model, inp, out):
+                tl = self._thread_local
+                if getattr(tl, "active", False) and idx in tl.layers:
+                    tl.feats.append(out)
+            return _hook
 
-    def _unregister_hooks(self) -> None:
-        """
-        unregisters the hooks. should be called after feature extraction.
-        """
-        for handle in self.hook_handlers:
-            handle.remove()
-        self.hook_handlers = []
+        def pre_hook(module, tkns):
+            tl = self._thread_local
+            drop_rate = getattr(tl, "drop_rate", 0)
+            if getattr(tl, "active", False) and drop_rate > 0:
+                bp_ = torch.ones_like(tkns[0][0, :, 0])
+                bp_[1:] = drop_rate
+                tkns = tkns[0][:, torch.bernoulli(bp_) > 0.5, :]
+                return (tkns,)
+
+        self.model.blocks[0].register_forward_pre_hook(pre_hook)
+        for idx, block in enumerate(self.model.blocks):
+            block.register_forward_hook(make_hook(idx))
+
+    def _register_hooks(self, layers: List[int], feats, drop_rate=0) -> None:
+        tl = self._thread_local
+        tl.active = True
+        tl.feats = feats
+        tl.layers = set(layers)
+        tl.drop_rate = drop_rate
+
+    def _unregister_hooks(self, _handles=None) -> None:
+        tl = self._thread_local
+        tl.active = False
+        tl.layers = None
+        tl.drop_rate = 0
 
     def _extract_features(self, batch: torch.Tensor, layers: List[int] = 11, drop_rate=0) -> List[torch.Tensor]:
         """
@@ -238,17 +238,15 @@ class ViTExtractor(nn.Module):
         :return : tensor of features with shape Bxtxd
         """
         B, C, H, W = batch.shape
-        self._feats = []
-        self._register_hooks(layers, drop_rate)
+        feats: List[torch.Tensor] = []
+        self._register_hooks(layers, feats, drop_rate)
         try:
             _ = self.model(batch)
+        finally:
             self._unregister_hooks()
-        except Exception as e:
-            self._unregister_hooks()
-            raise e
         self.load_size = (H, W)
         self.num_patches = (1 + (H - self.p) // self.stride[0], 1 + (W - self.p) // self.stride[1])
-        return self._feats
+        return feats
 
     def extract_descriptors(self, batch: torch.Tensor, layer: int = 11, drop_rate=0) -> torch.Tensor:
         """
@@ -260,8 +258,8 @@ class ViTExtractor(nn.Module):
         if type(layer) is not list:
             layer = [ layer ]
 
-        self._extract_features(batch, layer, drop_rate)
-        x = torch.stack(self._feats, dim=1)
+        feats = self._extract_features(batch, layer, drop_rate)
+        x = torch.stack(feats, dim=1)
         x = x.unsqueeze(dim=2) #Bxlx1xtxd # Default to facet = "token", always include CLS token
         desc = x.permute(0, 1, 3, 4, 2).flatten(start_dim=-2, end_dim=-1).unsqueeze(dim=2)  # Bxlx1xtx(dxh)
         return desc
